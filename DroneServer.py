@@ -85,7 +85,11 @@ def handle_sensor(conn, addr, gui_log):
                     # Update global history for charts
                     temperature_history.append(decoded['temperature'])
                     humidity_history.append(decoded['humidity'])
-                    timestamps.append(datetime.datetime.fromisoformat(decoded['timestamp'].replace('Z', '+00:00')))
+                    # Update global history for charts
+                    temperature_history.append(decoded["avg_temperature"])
+                    humidity_history.append(decoded["avg_humidity"])
+                    current_time = datetime.datetime.fromisoformat(decoded["timestamp"].replace('Z', '+00:00'))
+                    timestamps.append(current_time)
                 
                 gui_log(f"Received from {sensor_id}: Temp={decoded['temperature']}°C, Humidity={decoded['humidity']}%")
             
