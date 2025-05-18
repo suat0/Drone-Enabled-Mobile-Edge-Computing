@@ -130,16 +130,22 @@ def forward_to_central(gui_log):
             while True:
                 time.sleep(5)
                 with lock:
-                    if not sensor_data_buffer or returning_to_base:
+                    # Skip only if there's no sensor data and we're not returning to base
+                    if not sensor_data_buffer and not returning_to_base:
                         continue
 
-                    avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                    avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-
+                    # Calculate averages only if we have sensor data
+                    avg_temp = 0
+                    avg_hum = 0
                     all_anomalies = []
-                    for data in sensor_data_buffer:
-                        if 'anomalies' in data and data['anomalies']:
-                            all_anomalies.extend(data['anomalies'])
+                    
+                    if sensor_data_buffer:
+                        avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                        avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                        
+                        for data in sensor_data_buffer:
+                            if 'anomalies' in data and data['anomalies']:
+                                all_anomalies.extend(data['anomalies'])
 
                     payload = {
                         "drone_id": "drone1",
@@ -154,7 +160,7 @@ def forward_to_central(gui_log):
 
                     try:
                         s.sendall(json.dumps(payload).encode() + b"\n")
-                        gui_log(f"Forwarded to Central: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%")
+                        gui_log(f"Forwarded to Central: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%, Battery={battery_level}%")
                         if all_anomalies:
                             gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
                         sensor_data_buffer = []
