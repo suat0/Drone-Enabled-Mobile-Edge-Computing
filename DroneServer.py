@@ -1,4 +1,3 @@
-# DroneServer.py
 import socket
 import threading
 import tkinter as tk
@@ -120,49 +119,52 @@ def start_sensor_server(gui_log):
 
 def forward_to_central(gui_log):
     global sensor_data_buffer
-    
+
     while True:
-        time.sleep(5)  # Forward data every 5 seconds
-        
-        with lock:
-            if not sensor_data_buffer or returning_to_base:
-                continue
-            
-            # Process the data
-            if sensor_data_buffer:
-                avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                
-                # Collect all anomalies
-                all_anomalies = []
-                for data in sensor_data_buffer:
-                    if 'anomalies' in data and data['anomalies']:
-                        all_anomalies.extend(data['anomalies'])
-                
-                payload = {
-                    "drone_id": "drone1",
-                    "avg_temperature": round(avg_temp, 2),
-                    "avg_humidity": round(avg_hum, 2),
-                    "anomalies": all_anomalies,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "drone_status": drone_status,
-                    "battery_level": battery_level,
-                    "connected_sensors": list(connected_sensors)
-                }
-                
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.connect((CENTRAL_IP, CENTRAL_PORT))
-                        s.sendall(json.dumps(payload).encode())
+        try:
+            gui_log("Connecting to central server...")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((CENTRAL_IP, CENTRAL_PORT))
+            gui_log("Connected to central server.")
+
+            while True:
+                time.sleep(5)
+                with lock:
+                    if not sensor_data_buffer or returning_to_base:
+                        continue
+
+                    avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                    avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+
+                    all_anomalies = []
+                    for data in sensor_data_buffer:
+                        if 'anomalies' in data and data['anomalies']:
+                            all_anomalies.extend(data['anomalies'])
+
+                    payload = {
+                        "drone_id": "drone1",
+                        "avg_temperature": round(avg_temp, 2),
+                        "avg_humidity": round(avg_hum, 2),
+                        "anomalies": all_anomalies,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "drone_status": drone_status,
+                        "battery_level": battery_level,
+                        "connected_sensors": list(connected_sensors)
+                    }
+
+                    try:
+                        s.sendall(json.dumps(payload).encode() + b"\n")
                         gui_log(f"Forwarded to Central: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%")
                         if all_anomalies:
                             gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
-                    
-                    # Clear buffer after successful transmission
-                    sensor_data_buffer = []
-                    
-                except Exception as e:
-                    gui_log(f"Central server unreachable: {e}")
+                        sensor_data_buffer = []
+                    except Exception as send_error:
+                        gui_log(f"Error sending to central: {send_error}")
+                        break  # Reconnect
+
+        except Exception as conn_error:
+            gui_log(f"Could not connect to central: {conn_error}")
+            time.sleep(5)  # Retry
 
 def simulate_battery(gui_log, battery_var, status_var):
     global battery_level, drone_status, returning_to_base
@@ -233,19 +235,26 @@ def start_gui():
     chart_frame = ttk.LabelFrame(dashboard_frame, text="Real-time Data")
     chart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     
-    # Create matplotlib figure
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 5))
-    
-    # Temperature axis
-    ax1.set_title('Temperature (°C)')
+    # Create matplotlib figure with improved spacing
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 5), gridspec_kw={'hspace': 0.5})
+
+    # Temperature axis with proper configuration
+    ax1.set_title('Temperature (°C)', fontsize=11, pad=10)
     ax1.set_ylim(0, 40)
-    temp_line, = ax1.plot([], [], 'r-')
-    
-    # Humidity axis
-    ax2.set_title('Humidity (%)')
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    ax1.set_ylabel('Temperature (°C)', fontsize=10)
+    temp_line, = ax1.plot([], [], 'r-', linewidth=2)
+
+    # Humidity axis with proper configuration
+    ax2.set_title('Humidity (%)', fontsize=11, pad=10)
     ax2.set_ylim(0, 100)
-    hum_line, = ax2.plot([], [], 'b-')
-    
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    ax2.set_ylabel('Humidity (%)', fontsize=10)
+    hum_line, = ax2.plot([], [], 'b-', linewidth=2)
+
+    # Apply tight layout with additional padding
+    fig.tight_layout(pad=3.0)
+
     # Add figure to tkinter window
     canvas = FigureCanvasTkAgg(fig, master=chart_frame)
     canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -323,27 +332,55 @@ def start_gui():
     # Function to update the charts
     def update_charts():
         with lock:
-            if timestamps and temperature_history and humidity_history:
-                temp_line.set_xdata(range(len(temperature_history)))
-                temp_line.set_ydata(temperature_history)
-                ax1.set_xlim(0, len(temperature_history))
+            if len(temperature_history) > 0 and len(humidity_history) > 0:
+                # Get the data from the deques
+                temp_data = list(temperature_history)
+                hum_data = list(humidity_history)
                 
-                hum_line.set_xdata(range(len(humidity_history)))
-                hum_line.set_ydata(humidity_history)
-                ax2.set_xlim(0, len(humidity_history))
+                # Create x-axis data points (indices)
+                x_data = list(range(len(temp_data)))
                 
-                # Update connected sensors list
+                # Update the plot data
+                temp_line.set_xdata(x_data)
+                temp_line.set_ydata(temp_data)
+                hum_line.set_xdata(x_data)
+                hum_line.set_ydata(hum_data)
+                
+                # Adjust the plot limits
+                if len(x_data) > 1:
+                    ax1.set_xlim(0, len(x_data) - 1)
+                    ax2.set_xlim(0, len(x_data) - 1)
+                    
+                    # Set real-time labels on x-axis
+                    if len(timestamps) > 0:
+                        # Select a few timestamps for labels to avoid overcrowding
+                        num_labels = min(5, len(timestamps))
+                        label_indices = [int(i * (len(timestamps) - 1) / (num_labels - 1)) for i in range(num_labels)]
+                        time_labels = [timestamps[i].strftime("%H:%M:%S") for i in label_indices]
+                        
+                        ax1.set_xticks(label_indices)
+                        ax1.set_xticklabels(time_labels, rotation=45, fontsize=8)
+                        ax2.set_xticks(label_indices)
+                        ax2.set_xticklabels(time_labels, rotation=45, fontsize=8)
+                
+                # Update titles with current values
+                if temp_data:
+                    ax1.set_title(f'Temperature: {temp_data[-1]:.1f}°C', fontsize=11)
+                if hum_data:
+                    ax2.set_title(f'Humidity: {hum_data[-1]:.1f}%', fontsize=11)
+                
+                # Update connected sensors text
                 sensors_text.delete(1.0, tk.END)
-                sensors_text.insert(tk.END, f"Connected sensors ({len(connected_sensors)}): {', '.join(connected_sensors)}")
+                if connected_sensors:
+                    sensors_text.insert(tk.END, f"Connected sensors ({len(connected_sensors)}): {', '.join(connected_sensors)}")
+                else:
+                    sensors_text.insert(tk.END, "No sensors connected")
                 
-                # Redraw the canvas
-                canvas.draw()
+                # Force a redraw of the canvas
+                canvas.draw_idle()
         
         # Schedule the next update
-        root.after(2000, update_charts)
-    
-    # Start the update function
-    update_charts()
+        root.after(1000, update_charts)  # Update more frequently (every second)
     
     # Start server threads
     threading.Thread(target=start_sensor_server, args=(gui_log,), daemon=True).start()
@@ -352,6 +389,9 @@ def start_gui():
     
     # Initial log
     gui_log("Drone Edge Server started")
+    
+    # Start the chart update loop after a short delay
+    root.after(1000, update_charts)
     
     # Start the main loop
     root.mainloop()
