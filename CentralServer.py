@@ -49,20 +49,28 @@ def handle_drone(conn, addr, gui_log):
                                 "connected_sensors": []
                             }
                         
-                        drones_data[drone_id]["avg_temperature"].append(decoded["avg_temperature"])
-                        drones_data[drone_id]["avg_humidity"].append(decoded["avg_humidity"])
+                        # Only update sensor data if it's provided
+                        if "avg_temperature" in decoded and "avg_humidity" in decoded:
+                            drones_data[drone_id]["avg_temperature"].append(decoded["avg_temperature"])
+                            drones_data[drone_id]["avg_humidity"].append(decoded["avg_humidity"])
+                            # Update global history for charts
+                            temperature_history.append(decoded["avg_temperature"])
+                            humidity_history.append(decoded["avg_humidity"])
+                        
+                        # Always update these fields
                         drones_data[drone_id]["timestamps"].append(decoded["timestamp"])
                         drones_data[drone_id]["battery_level"] = decoded.get("battery_level", 0)
                         drones_data[drone_id]["status"] = decoded.get("drone_status", "Unknown")
-                        drones_data[drone_id]["connected_sensors"] = decoded.get("connected_sensors", [])
                         
-                        # Update global history for charts
-                        temperature_history.append(decoded["avg_temperature"])
-                        humidity_history.append(decoded["avg_humidity"])
+                        # Update connected sensors if provided
+                        if "connected_sensors" in decoded:
+                            drones_data[drone_id]["connected_sensors"] = decoded["connected_sensors"]
+                        
+                        # Update timestamp for charts
                         current_time = datetime.datetime.fromisoformat(decoded["timestamp"].replace('Z', '+00:00'))
                         timestamps.append(current_time)
                         
-                        # Handle anomalies
+                        # Handle anomalies if provided
                         if "anomalies" in decoded and decoded["anomalies"]:
                             for anomaly in decoded["anomalies"]:
                                 anomaly_record = {
@@ -74,7 +82,10 @@ def handle_drone(conn, addr, gui_log):
                                 gui_log(f"Anomaly from {drone_id}: {anomaly}")
                     
                     # Log the received data
-                    gui_log(f"Received from {drone_id}: Avg Temp={decoded['avg_temperature']}°C, Avg Humidity={decoded['avg_humidity']}%, Status={decoded.get('drone_status', 'Unknown')}, Battery={decoded.get('battery_level', 'Unknown')}%")
+                    if "avg_temperature" in decoded and "avg_humidity" in decoded:
+                        gui_log(f"Received from {drone_id}: Avg Temp={decoded['avg_temperature']}°C, Avg Humidity={decoded['avg_humidity']}%, Status={decoded.get('drone_status', 'Unknown')}, Battery={decoded.get('battery_level', 'Unknown')}%")
+                    else:
+                        gui_log(f"Status Update from {drone_id}: Status={decoded.get('drone_status', 'Unknown')}, Battery={decoded.get('battery_level', 'Unknown')}%")
                     
                 except json.JSONDecodeError:
                     gui_log(f"Invalid JSON received from {addr}")

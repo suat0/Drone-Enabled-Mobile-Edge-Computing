@@ -44,10 +44,22 @@ def handle_sensor(conn, addr, gui_log):
         gui_log(f"Connected to sensor at {addr}")
         while True:
             try:
+                # Check if we're returning to base before receiving data
+                with lock:
+                    if returning_to_base:
+                        gui_log(f"Disconnecting sensor at {addr} - Drone is returning to base")
+                        break
+
                 data = conn.recv(1024)
                 if not data:
                     break
                 
+                # Check again after receiving data
+                with lock:
+                    if returning_to_base:
+                        gui_log(f"Discarding data from {addr} - Drone is returning to base")
+                        continue
+
                 decoded = json.loads(data.decode())
                 sensor_id = decoded['sensor_id']
                 
@@ -85,8 +97,10 @@ def handle_sensor(conn, addr, gui_log):
                     # Update global history for charts
                     temperature_history.append(decoded['temperature'])
                     humidity_history.append(decoded['humidity'])
-                    timestamps.append(datetime.datetime.fromisoformat(decoded['timestamp'].replace('Z', '+00:00')))
-                
+                    # Convert to local time
+                    utc_time = datetime.datetime.fromisoformat(decoded['timestamp'].replace('Z', '+00:00'))
+                    local_time = utc_time.astimezone()  # Convert to local timezone
+                    timestamps.append(local_time)                
                 gui_log(f"Received from {sensor_id}: Temp={decoded['temperature']}°C, Humidity={decoded['humidity']}%")
             
             except json.JSONDecodeError:
@@ -112,40 +126,73 @@ def start_sensor_server(gui_log):
     while True:
         try:
             conn, addr = server.accept()
+            with lock:
+                if returning_to_base:
+                    # Reject connection if returning to base
+                    conn.close()
+                    gui_log(f"Rejected sensor connection from {addr} - Drone is returning to base")
+                    continue
             threading.Thread(target=handle_sensor, args=(conn, addr, gui_log)).start()
         except Exception as e:
             gui_log(f"Error accepting connection: {e}")
             time.sleep(1)
+
+def send_status_updates(gui_log):
+    """
+    Separate thread for sending status and battery updates to central server
+    """
+    while True:
+        try:
+            gui_log("Connecting to central server for status updates...")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((CENTRAL_IP, CENTRAL_PORT))
+            gui_log("Connected to central server for status updates.")
+
+            while True:
+                time.sleep(5)  # Send updates every 5 seconds
+                with lock:
+                    # Always send only essential data
+                    payload = {
+                        "drone_id": "drone1",
+                        "drone_status": drone_status,
+                        "battery_level": battery_level,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }
+
+                try:
+                    s.sendall(json.dumps(payload).encode() + b"\n")
+                    gui_log(f"Status Update: Status={drone_status}, Battery={battery_level}%")
+                except Exception as send_error:
+                    gui_log(f"Error sending status update: {send_error}")
+                    break  # Reconnect
+
+        except Exception as conn_error:
+            gui_log(f"Could not connect to central server for status updates: {conn_error}")
+            time.sleep(5)  # Retry
 
 def forward_to_central(gui_log):
     global sensor_data_buffer
 
     while True:
         try:
-            gui_log("Connecting to central server...")
+            gui_log("Connecting to central server for sensor data...")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((CENTRAL_IP, CENTRAL_PORT))
-            gui_log("Connected to central server.")
+            gui_log("Connected to central server for sensor data.")
 
             while True:
                 time.sleep(5)
                 with lock:
-                    # Skip only if there's no sensor data and we're not returning to base
-                    if not sensor_data_buffer and not returning_to_base:
+                    if not sensor_data_buffer or returning_to_base:
                         continue
 
-                    # Calculate averages only if we have sensor data
-                    avg_temp = 0
-                    avg_hum = 0
-                    all_anomalies = []
+                    avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                    avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
                     
-                    if sensor_data_buffer:
-                        avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                        avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                        
-                        for data in sensor_data_buffer:
-                            if 'anomalies' in data and data['anomalies']:
-                                all_anomalies.extend(data['anomalies'])
+                    all_anomalies = []
+                    for data in sensor_data_buffer:
+                        if 'anomalies' in data and data['anomalies']:
+                            all_anomalies.extend(data['anomalies'])
 
                     payload = {
                         "drone_id": "drone1",
@@ -160,16 +207,16 @@ def forward_to_central(gui_log):
 
                     try:
                         s.sendall(json.dumps(payload).encode() + b"\n")
-                        gui_log(f"Forwarded to Central: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%, Battery={battery_level}%")
+                        gui_log(f"Sensor Data: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%")
                         if all_anomalies:
                             gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
                         sensor_data_buffer = []
                     except Exception as send_error:
-                        gui_log(f"Error sending to central: {send_error}")
+                        gui_log(f"Error sending sensor data: {send_error}")
                         break  # Reconnect
 
         except Exception as conn_error:
-            gui_log(f"Could not connect to central: {conn_error}")
+            gui_log(f"Could not connect to central server for sensor data: {conn_error}")
             time.sleep(5)  # Retry
 
 def simulate_battery(gui_log, battery_var, status_var):
@@ -391,6 +438,7 @@ def start_gui():
     # Start server threads
     threading.Thread(target=start_sensor_server, args=(gui_log,), daemon=True).start()
     threading.Thread(target=forward_to_central, args=(gui_log,), daemon=True).start()
+    threading.Thread(target=send_status_updates, args=(gui_log,), daemon=True).start()  # Add new status update thread
     threading.Thread(target=simulate_battery, args=(gui_log, battery_var, status_var), daemon=True).start()
     
     # Initial log
