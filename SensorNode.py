@@ -103,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument("--drone_ip", default="127.0.0.1", help="IP address of the drone")
     parser.add_argument("--drone_port", type=int, default=8888, help="Port number of the drone")
     parser.add_argument("--sensor_id", default="sensor1", help="Unique identifier for this sensor")
-    parser.add_argument("--interval", type=int, default=2, help="Data transmission interval in seconds")
+    parser.add_argument("--interval", type=int, default=5, help="Data transmission interval in seconds")
     parser.add_argument("--anomaly_frequency", type=int, default=20, help="1 in X chance to generate anomalous data")
     
     args = parser.parse_args()

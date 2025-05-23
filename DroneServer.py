@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
 import datetime
+import queue
+import logging
+from contextlib import contextmanager
 
 SENSOR_PORT = 8888
 CENTRAL_IP = "127.0.0.1"
@@ -35,220 +38,363 @@ temperature_history = deque(maxlen=DATA_BUFFER_SIZE)
 humidity_history = deque(maxlen=DATA_BUFFER_SIZE)
 timestamps = deque(maxlen=DATA_BUFFER_SIZE)
 
-# Lock for thread-safe operations
-lock = threading.Lock()
+# Thread-safe queues for better communication
+log_queue = queue.Queue()
+gui_update_queue = queue.Queue()
+
+# Improved locks
+data_lock = threading.RLock()  # Re-entrant lock for nested operations
+status_lock = threading.RLock()
+
+# Server control
+server_running = True
+server_socket = None
+
+@contextmanager
+def safe_lock(lock):
+    """Context manager for safe lock handling"""
+    acquired = False
+    try:
+        acquired = lock.acquire(timeout=1.0)  # 1 second timeout
+        if not acquired:
+            raise TimeoutError("Could not acquire lock")
+        yield
+    finally:
+        if acquired:
+            lock.release()
+
+def setup_logging():
+    """Setup proper logging"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('drone_server.log')
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
 
 def handle_sensor(conn, addr, gui_log):
+    """Improved sensor handler with better error handling and non-blocking operations"""
     sensor_id = None
-    with conn:
-        gui_log(f"Connected to sensor at {addr}")
-        while True:
-            try:
-                # Check if we're returning to base before receiving data
-                with lock:
-                    if returning_to_base:
-                        gui_log(f"Disconnecting sensor at {addr} - Drone is returning to base")
-                        break
-
-                data = conn.recv(1024)
-                if not data:
-                    break
-                
-                # Check again after receiving data
-                with lock:
-                    if returning_to_base:
-                        gui_log(f"Discarding data from {addr} - Drone is returning to base")
-                        continue
-
-                decoded = json.loads(data.decode())
-                sensor_id = decoded['sensor_id']
-                
-                with lock:
-                    if sensor_id not in connected_sensors:
-                        connected_sensors.add(sensor_id)
-                        gui_log(f"New sensor registered: {sensor_id}")
-                    
-                    # Check for anomalies
-                    anomalies = []
-                    if not (ANOMALY_TEMP_RANGE[0] <= decoded['temperature'] <= ANOMALY_TEMP_RANGE[1]):
-                        anomaly = f"Temperature anomaly detected: {decoded['temperature']}°C from {sensor_id}"
-                        anomalies.append(anomaly)
-                        gui_log(anomaly)
-                    
-                    if not (ANOMALY_HUMIDITY_RANGE[0] <= decoded['humidity'] <= ANOMALY_HUMIDITY_RANGE[1]):
-                        anomaly = f"Humidity anomaly detected: {decoded['humidity']}% from {sensor_id}"
-                        anomalies.append(anomaly)
-                        gui_log(anomaly)
-                    
-                    # Add anomaly flag to data
-                    decoded['anomalies'] = anomalies
-                    
-                    # Store in buffer for processing
-                    sensor_data_buffer.append(decoded)
-                    
-                    # Store for visualization
-                    if sensor_id not in data_history:
-                        data_history[sensor_id] = {'temperature': [], 'humidity': [], 'timestamps': []}
-                    
-                    data_history[sensor_id]['temperature'].append(decoded['temperature'])
-                    data_history[sensor_id]['humidity'].append(decoded['humidity'])
-                    data_history[sensor_id]['timestamps'].append(decoded['timestamp'])
-                    
-                    # Update global history for charts
-                    temperature_history.append(decoded['temperature'])
-                    humidity_history.append(decoded['humidity'])
-                    # Convert to local time
-                    utc_time = datetime.datetime.fromisoformat(decoded['timestamp'].replace('Z', '+00:00'))
-                    local_time = utc_time.astimezone()  # Convert to local timezone
-                    timestamps.append(local_time)                
-                gui_log(f"Received from {sensor_id}: Temp={decoded['temperature']}°C, Humidity={decoded['humidity']}%")
+    conn.settimeout(5.0)  # Set socket timeout
+    
+    try:
+        with conn:
+            gui_log(f"Connected to sensor at {addr}")
             
-            except json.JSONDecodeError:
-                gui_log(f"Invalid JSON from {addr}")
-                break
-            except Exception as e:
-                gui_log(f"Error handling sensor data: {e}")
-                break
-    
-    with lock:
-        if sensor_id and sensor_id in connected_sensors:
-            connected_sensors.remove(sensor_id)
-    
-    gui_log(f"Disconnected sensor at {addr}")
+            while server_running:
+                try:
+                    # Check if we're returning to base before receiving data
+                    with safe_lock(status_lock):
+                        if returning_to_base:
+                            gui_log(f"Disconnecting sensor at {addr} - Drone is returning to base")
+                            break
+
+                    # Non-blocking receive with timeout
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                    
+                    # Check again after receiving data
+                    with safe_lock(status_lock):
+                        if returning_to_base:
+                            gui_log(f"Discarding data from {addr} - Drone is returning to base")
+                            continue
+
+                    decoded = json.loads(data.decode())
+                    sensor_id = decoded['sensor_id']
+                    
+                    # Process data in separate thread to avoid blocking
+                    threading.Thread(
+                        target=process_sensor_data, 
+                        args=(decoded, sensor_id, gui_log),
+                        daemon=True
+                    ).start()
+                    
+                except socket.timeout:
+                    # Check if we should continue or break
+                    with safe_lock(status_lock):
+                        if returning_to_base:
+                            break
+                    continue
+                    
+                except json.JSONDecodeError as e:
+                    gui_log(f"Invalid JSON from {addr}: {e}")
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"Error handling sensor data from {addr}: {e}")
+                    break
+                    
+    except Exception as e:
+        logger.error(f"Connection error with {addr}: {e}")
+    finally:
+        # Clean up sensor connection
+        if sensor_id:
+            with safe_lock(data_lock):
+                connected_sensors.discard(sensor_id)
+        gui_log(f"Disconnected sensor at {addr}")
+
+def process_sensor_data(decoded, sensor_id, gui_log):
+    """Process sensor data in separate thread to avoid blocking"""
+    try:
+        with safe_lock(data_lock):
+            if sensor_id not in connected_sensors:
+                connected_sensors.add(sensor_id)
+                gui_log(f"New sensor registered: {sensor_id}")
+            
+            # Check for anomalies
+            anomalies = []
+            if not (ANOMALY_TEMP_RANGE[0] <= decoded['temperature'] <= ANOMALY_TEMP_RANGE[1]):
+                anomaly = f"Temperature anomaly detected: {decoded['temperature']}°C from {sensor_id}"
+                anomalies.append(anomaly)
+                gui_log(anomaly)
+            
+            if not (ANOMALY_HUMIDITY_RANGE[0] <= decoded['humidity'] <= ANOMALY_HUMIDITY_RANGE[1]):
+                anomaly = f"Humidity anomaly detected: {decoded['humidity']}% from {sensor_id}"
+                anomalies.append(anomaly)
+                gui_log(anomaly)
+            
+            # Add anomaly flag to data
+            decoded['anomalies'] = anomalies
+            
+            # Store in buffer for processing
+            sensor_data_buffer.append(decoded)
+            
+            # Store for visualization
+            if sensor_id not in data_history:
+                data_history[sensor_id] = {'temperature': [], 'humidity': [], 'timestamps': []}
+            
+            data_history[sensor_id]['temperature'].append(decoded['temperature'])
+            data_history[sensor_id]['humidity'].append(decoded['humidity'])
+            data_history[sensor_id]['timestamps'].append(decoded['timestamp'])
+            
+            # Update global history for charts
+            temperature_history.append(decoded['temperature'])
+            humidity_history.append(decoded['humidity'])
+            
+            # Convert to local time
+            utc_time = datetime.datetime.fromisoformat(decoded['timestamp'].replace('Z', '+00:00'))
+            local_time = utc_time.astimezone()
+            timestamps.append(local_time)
+            
+        gui_log(f"Received from {sensor_id}: Temp={decoded['temperature']}°C, Humidity={decoded['humidity']}%")
+        
+    except Exception as e:
+        logger.error(f"Error processing sensor data: {e}")
 
 def start_sensor_server(gui_log):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", SENSOR_PORT))
-    server.listen(5)
-    gui_log(f"Drone listening on port {SENSOR_PORT}")
+    """Improved sensor server with better connection handling"""
+    global server_socket, server_running
     
-    while True:
-        try:
-            conn, addr = server.accept()
-            with lock:
-                if returning_to_base:
-                    # Reject connection if returning to base
-                    conn.close()
-                    gui_log(f"Rejected sensor connection from {addr} - Drone is returning to base")
-                    continue
-            threading.Thread(target=handle_sensor, args=(conn, addr, gui_log)).start()
-        except Exception as e:
-            gui_log(f"Error accepting connection: {e}")
-            time.sleep(1)
+    try:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.settimeout(1.0)  # Set timeout for accept operations
+        server_socket.bind(("0.0.0.0", SENSOR_PORT))
+        server_socket.listen(10)  # Increased backlog
+        gui_log(f"Drone listening on port {SENSOR_PORT}")
+        
+        while server_running:
+            try:
+                conn, addr = server_socket.accept()
+                
+                with safe_lock(status_lock):
+                    if returning_to_base:
+                        # Reject connection if returning to base
+                        conn.close()
+                        gui_log(f"Rejected sensor connection from {addr} - Drone is returning to base")
+                        continue
+                
+                # Start handler thread with daemon flag
+                handler_thread = threading.Thread(
+                    target=handle_sensor, 
+                    args=(conn, addr, gui_log),
+                    daemon=True
+                )
+                handler_thread.start()
+                
+            except socket.timeout:
+                # Normal timeout, continue checking server_running
+                continue
+            except Exception as e:
+                if server_running:  # Only log if we're still supposed to be running
+                    logger.error(f"Error accepting connection: {e}")
+                    time.sleep(0.1)  # Brief pause before retry
+                    
+    except Exception as e:
+        logger.error(f"Server startup error: {e}")
+    finally:
+        if server_socket:
+            server_socket.close()
 
 def send_status_updates(gui_log):
-    """
-    Separate thread for sending status and battery updates to central server
-    """
-    while True:
+    """Improved status updates with connection pooling"""
+    retry_delay = 1
+    max_retry_delay = 30
+    
+    while server_running:
         try:
             gui_log("Connecting to central server for status updates...")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10.0)  # Set connection timeout
             s.connect((CENTRAL_IP, CENTRAL_PORT))
             gui_log("Connected to central server for status updates.")
+            retry_delay = 1  # Reset retry delay on successful connection
 
-            while True:
+            while server_running:
                 time.sleep(5)  # Send updates every 5 seconds
-                with lock:
-                    # Always send only essential data
-                    payload = {
-                        "drone_id": "drone1",
-                        "drone_status": drone_status,
-                        "battery_level": battery_level,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    }
-
+                
                 try:
+                    with safe_lock(status_lock):
+                        # Always send only essential data
+                        payload = {
+                            "drone_id": "drone1",
+                            "drone_status": drone_status,
+                            "battery_level": battery_level,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        }
+
                     s.sendall(json.dumps(payload).encode() + b"\n")
                     gui_log(f"Status Update: Status={drone_status}, Battery={battery_level}%")
-                except Exception as send_error:
+                    
+                except socket.error as send_error:
                     gui_log(f"Error sending status update: {send_error}")
                     break  # Reconnect
+                except Exception as e:
+                    logger.error(f"Unexpected error in status update: {e}")
+                    break
 
         except Exception as conn_error:
-            gui_log(f"Could not connect to central server for status updates: {conn_error}")
-            time.sleep(5)  # Retry
+            if server_running:
+                gui_log(f"Could not connect to central server for status updates: {conn_error}")
+                time.sleep(min(retry_delay, max_retry_delay))
+                retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
 
 def forward_to_central(gui_log):
+    """Improved central forwarding with better error handling"""
     global sensor_data_buffer
+    retry_delay = 1
+    max_retry_delay = 30
 
-    while True:
+    while server_running:
         try:
             gui_log("Connecting to central server for sensor data...")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10.0)
             s.connect((CENTRAL_IP, CENTRAL_PORT))
             gui_log("Connected to central server for sensor data.")
+            retry_delay = 1  # Reset retry delay
 
-            while True:
+            while server_running:
                 time.sleep(5)
-                with lock:
-                    if not sensor_data_buffer or returning_to_base:
-                        continue
+                
+                try:
+                    with safe_lock(data_lock):
+                        if not sensor_data_buffer:
+                            continue
+                            
+                        with safe_lock(status_lock):
+                            if returning_to_base:
+                                continue
 
-                    avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                    avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                        # Process buffer data
+                        buffer_copy = sensor_data_buffer.copy()
+                        sensor_data_buffer.clear()  # Clear buffer after copying
+                        
+                        if not buffer_copy:
+                            continue
+
+                    # Calculate outside of lock
+                    avg_temp = sum(d["temperature"] for d in buffer_copy) / len(buffer_copy)
+                    avg_hum = sum(d["humidity"] for d in buffer_copy) / len(buffer_copy)
                     
                     all_anomalies = []
-                    for data in sensor_data_buffer:
+                    for data in buffer_copy:
                         if 'anomalies' in data and data['anomalies']:
                             all_anomalies.extend(data['anomalies'])
 
-                    payload = {
-                        "drone_id": "drone1",
-                        "avg_temperature": round(avg_temp, 2),
-                        "avg_humidity": round(avg_hum, 2),
-                        "anomalies": all_anomalies,
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "drone_status": drone_status,
-                        "battery_level": battery_level,
-                        "connected_sensors": list(connected_sensors)
-                    }
+                    with safe_lock(status_lock):
+                        payload = {
+                            "drone_id": "drone1",
+                            "avg_temperature": round(avg_temp, 2),
+                            "avg_humidity": round(avg_hum, 2),
+                            "anomalies": all_anomalies,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "drone_status": drone_status,
+                            "battery_level": battery_level,
+                            "connected_sensors": list(connected_sensors)
+                        }
 
-                    try:
-                        s.sendall(json.dumps(payload).encode() + b"\n")
-                        gui_log(f"Sensor Data: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%")
-                        if all_anomalies:
-                            gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
-                        sensor_data_buffer = []
-                    except Exception as send_error:
-                        gui_log(f"Error sending sensor data: {send_error}")
-                        break  # Reconnect
+                    s.sendall(json.dumps(payload).encode() + b"\n")
+                    gui_log(f"Sensor Data: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%")
+                    if all_anomalies:
+                        gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
+                        
+                except socket.error as send_error:
+                    gui_log(f"Error sending sensor data: {send_error}")
+                    break  # Reconnect
+                except Exception as e:
+                    logger.error(f"Unexpected error in data forwarding: {e}")
+                    break
 
         except Exception as conn_error:
-            gui_log(f"Could not connect to central server for sensor data: {conn_error}")
-            time.sleep(5)  # Retry
+            if server_running:
+                gui_log(f"Could not connect to central server for sensor data: {conn_error}")
+                time.sleep(min(retry_delay, max_retry_delay))
+                retry_delay = min(retry_delay * 2, max_retry_delay)
 
 def simulate_battery(gui_log, battery_var, status_var):
+    """Improved battery simulation with thread safety"""
     global battery_level, drone_status, returning_to_base
     
-    while True:
+    while server_running:
         time.sleep(10)  # Update battery every 10 seconds
         
-        with lock:
-            if returning_to_base:
-                # Charging
-                battery_level = min(MAX_BATTERY_LEVEL, battery_level + BATTERY_CHARGE_RATE)
-                if battery_level >= MAX_BATTERY_LEVEL:
-                    returning_to_base = False
-                    drone_status = "Active"
-                    gui_log("Battery fully charged. Drone is now active.")
-            else:
-                # Discharging
-                battery_level = max(0, battery_level - BATTERY_DRAIN_RATE)
-                if battery_level <= BATTERY_THRESHOLD:
-                    returning_to_base = True
-                    drone_status = "Returning to Base"
-                    gui_log(f"Battery level ({battery_level}%) below threshold. Returning to base.")
-        
-        # Update GUI
-        battery_var.set(battery_level)
-        status_var.set(drone_status)
+        try:
+            with safe_lock(status_lock):
+                if returning_to_base:
+                    # Charging
+                    battery_level = min(MAX_BATTERY_LEVEL, battery_level + BATTERY_CHARGE_RATE)
+                    if battery_level >= MAX_BATTERY_LEVEL:
+                        returning_to_base = False
+                        drone_status = "Active"
+                        gui_log("Battery fully charged. Drone is now active.")
+                else:
+                    # Discharging
+                    battery_level = max(0, battery_level - BATTERY_DRAIN_RATE)
+                    if battery_level <= BATTERY_THRESHOLD:
+                        returning_to_base = True
+                        drone_status = "Returning to Base"
+                        gui_log(f"Battery level ({battery_level}%) below threshold. Returning to base.")
+            
+            # Update GUI in main thread
+            gui_update_queue.put(('battery', battery_level))
+            gui_update_queue.put(('status', drone_status))
+            
+        except Exception as e:
+            logger.error(f"Error in battery simulation: {e}")
 
 def start_gui():
+    global server_running
+    
     root = tk.Tk()
     root.title("Drone Edge Server")
     root.geometry("1000x700")
+    
+    # Handle window close event
+    def on_closing():
+        global server_running
+        server_running = False
+        if server_socket:
+            server_socket.close()
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     
     # Create notebook with tabs
     notebook = ttk.Notebook(root)
@@ -336,7 +482,7 @@ def start_gui():
         try:
             new_level = int(battery_entry.get())
             if 0 <= new_level <= 100:
-                with lock:
+                with safe_lock(status_lock):
                     battery_level = new_level
                     battery_var.set(new_level)
                 gui_log(f"Battery level manually set to {new_level}%")
@@ -354,7 +500,7 @@ def start_gui():
     # Force return to base
     def force_return():
         global returning_to_base, drone_status
-        with lock:
+        with safe_lock(status_lock):
             returning_to_base = True
             drone_status = "Returning to Base"
             status_var.set(drone_status)
@@ -365,7 +511,7 @@ def start_gui():
     # Resume normal operation
     def resume_operation():
         global returning_to_base, drone_status
-        with lock:
+        with safe_lock(status_lock):
             returning_to_base = False
             drone_status = "Active"
             status_var.set(drone_status)
@@ -373,79 +519,111 @@ def start_gui():
     
     ttk.Button(battery_control_frame, text="Resume Normal Operation", command=resume_operation).grid(row=2, column=0, columnspan=3, padx=5, pady=5)
     
-    # Define log function
+    # Define log function with queue
     def gui_log(message):
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        log_text.see(tk.END)
-        
-        # Add to buffer for potential forwarding
-        log_buffer.append(f"[{timestamp}] {message}")
+        log_queue.put(message)
     
-    # Function to update the charts
+    # Process log queue
+    def process_log_queue():
+        try:
+            while True:
+                message = log_queue.get_nowait()
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+                log_text.see(tk.END)
+                log_buffer.append(f"[{timestamp}] {message}")
+        except queue.Empty:
+            pass
+        finally:
+            root.after(100, process_log_queue)  # Check queue every 100ms
+    
+    # Process GUI updates
+    def process_gui_updates():
+        try:
+            while True:
+                update_type, value = gui_update_queue.get_nowait()
+                if update_type == 'battery':
+                    battery_var.set(value)
+                elif update_type == 'status':
+                    status_var.set(value)
+        except queue.Empty:
+            pass
+        finally:
+            root.after(200, process_gui_updates)  # Check queue every 200ms
+    
+    # Function to update the charts (optimized)
     def update_charts():
-        with lock:
-            if len(temperature_history) > 0 and len(humidity_history) > 0:
-                # Get the data from the deques
-                temp_data = list(temperature_history)
-                hum_data = list(humidity_history)
-                
-                # Create x-axis data points (indices)
-                x_data = list(range(len(temp_data)))
-                
-                # Update the plot data
-                temp_line.set_xdata(x_data)
-                temp_line.set_ydata(temp_data)
-                hum_line.set_xdata(x_data)
-                hum_line.set_ydata(hum_data)
-                
-                # Adjust the plot limits
-                if len(x_data) > 1:
-                    ax1.set_xlim(0, len(x_data) - 1)
-                    ax2.set_xlim(0, len(x_data) - 1)
+        if not server_running:
+            return
+            
+        try:
+            with safe_lock(data_lock):
+                if len(temperature_history) > 0 and len(humidity_history) > 0:
+                    # Get the data from the deques
+                    temp_data = list(temperature_history)
+                    hum_data = list(humidity_history)
                     
-                    # Set real-time labels on x-axis
-                    if len(timestamps) > 0:
-                        # Select a few timestamps for labels to avoid overcrowding
-                        num_labels = min(5, len(timestamps))
-                        label_indices = [int(i * (len(timestamps) - 1) / (num_labels - 1)) for i in range(num_labels)]
-                        time_labels = [timestamps[i].strftime("%H:%M:%S") for i in label_indices]
+                    # Create x-axis data points (indices)
+                    x_data = list(range(len(temp_data)))
+                    
+                    # Update the plot data
+                    temp_line.set_xdata(x_data)
+                    temp_line.set_ydata(temp_data)
+                    hum_line.set_xdata(x_data)
+                    hum_line.set_ydata(hum_data)
+                    
+                    # Adjust the plot limits
+                    if len(x_data) > 1:
+                        ax1.set_xlim(0, len(x_data) - 1)
+                        ax2.set_xlim(0, len(x_data) - 1)
                         
-                        ax1.set_xticks(label_indices)
-                        ax1.set_xticklabels(time_labels, rotation=45, fontsize=8)
-                        ax2.set_xticks(label_indices)
-                        ax2.set_xticklabels(time_labels, rotation=45, fontsize=8)
-                
-                # Update titles with current values
-                if temp_data:
-                    ax1.set_title(f'Temperature: {temp_data[-1]:.1f}°C', fontsize=11)
-                if hum_data:
-                    ax2.set_title(f'Humidity: {hum_data[-1]:.1f}%', fontsize=11)
-                
-                # Update connected sensors text
-                sensors_text.delete(1.0, tk.END)
-                if connected_sensors:
-                    sensors_text.insert(tk.END, f"Connected sensors ({len(connected_sensors)}): {', '.join(connected_sensors)}")
-                else:
-                    sensors_text.insert(tk.END, "No sensors connected")
-                
-                # Force a redraw of the canvas
-                canvas.draw_idle()
-        
-        # Schedule the next update
-        root.after(1000, update_charts)  # Update more frequently (every second)
+                        # Set real-time labels on x-axis
+                        if len(timestamps) > 0:
+                            # Select a few timestamps for labels to avoid overcrowding
+                            num_labels = min(5, len(timestamps))
+                            if num_labels > 1:
+                                label_indices = [int(i * (len(timestamps) - 1) / (num_labels - 1)) for i in range(num_labels)]
+                                time_labels = [timestamps[i].strftime("%H:%M:%S") for i in label_indices]
+                                
+                                ax1.set_xticks(label_indices)
+                                ax1.set_xticklabels(time_labels, rotation=45, fontsize=8)
+                                ax2.set_xticks(label_indices)
+                                ax2.set_xticklabels(time_labels, rotation=45, fontsize=8)
+                    
+                    # Update titles with current values
+                    if temp_data:
+                        ax1.set_title(f'Temperature: {temp_data[-1]:.1f}°C', fontsize=11)
+                    if hum_data:
+                        ax2.set_title(f'Humidity: {hum_data[-1]:.1f}%', fontsize=11)
+                    
+                    # Update connected sensors text
+                    sensors_text.delete(1.0, tk.END)
+                    if connected_sensors:
+                        sensors_text.insert(tk.END, f"Connected sensors ({len(connected_sensors)}): {', '.join(connected_sensors)}")
+                    else:
+                        sensors_text.insert(tk.END, "No sensors connected")
+                    
+                    # Force a redraw of the canvas
+                    canvas.draw_idle()
+        except Exception as e:
+            logger.error(f"Error updating charts: {e}")
+        finally:
+            # Schedule the next update
+            root.after(2000, update_charts)  # Update every 2 seconds instead of 1
     
     # Start server threads
     threading.Thread(target=start_sensor_server, args=(gui_log,), daemon=True).start()
     threading.Thread(target=forward_to_central, args=(gui_log,), daemon=True).start()
-    threading.Thread(target=send_status_updates, args=(gui_log,), daemon=True).start()  # Add new status update thread
+    threading.Thread(target=send_status_updates, args=(gui_log,), daemon=True).start()
     threading.Thread(target=simulate_battery, args=(gui_log, battery_var, status_var), daemon=True).start()
     
     # Initial log
     gui_log("Drone Edge Server started")
     
-    # Start the chart update loop after a short delay
-    root.after(1000, update_charts)
+    # Start the update loops
+    root.after(100, process_log_queue)
+    root.after(200, process_gui_updates)
+    root.after(2000, update_charts)
     
     # Start the main loop
     root.mainloop()
